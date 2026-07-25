@@ -1,0 +1,229 @@
+name: Build Expo Go (unsigned IPA)
+
+# Builds the Expo Go app from expo/expo source as an UNSIGNED .ipa,
+# so it can be sideloaded with SideStore / AltStore (which re-sign it
+# with a free Apple ID at install time).
+#
+# Run manually: Actions -> "Build Expo Go (unsigned IPA)" -> Run workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      expo_ref:
+        description: 'Branch/tag of expo/expo to build (sdk-57, sdk-56, ...)'
+        required: true
+        default: 'sdk-57'
+      drop_notification_extension:
+        description: 'Remove the notification service extension (fewer App IDs used by SideStore)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: expo-go-unsigned-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 340
+
+    env:
+      EXPO_REF: ${{ inputs.expo_ref }}
+      IOS_DIR: apps/expo-go/ios
+
+    steps:
+      - name: 👀 Checkout expo/expo @ ${{ inputs.expo_ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: expo/expo
+          ref: ${{ inputs.expo_ref }}
+          submodules: true
+          fetch-depth: 1
+
+      # The .gitmodules for react-native-lab uses an SSH URL; actions/checkout
+      # rewrites it to HTTPS via insteadOf, but re-assert it in case a nested
+      # submodule slips through.
+      - name: 🔗 Force HTTPS for submodules
+        run: |
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+          git submodule update --init --recursive --depth 1 || true
+
+      - name: 🧾 Confirm this ref really is the SDK we want
+        run: |
+          echo "sdkVersions.json: $(cat apps/expo-go/sdkVersions.json)"
+          echo "packages/expo version: $(node -p "require('./packages/expo/package.json').version")"
+          echo "react-native version: $(node -p "require('./apps/expo-go/package.json').dependencies['react-native']")"
+          echo "SDK_VERSION=$(node -p "require('./apps/expo-go/sdkVersions.json').sdkVersion")" >> $GITHUB_ENV
+
+      - name: 🔨 Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          # Expo builds SDK 57 with Xcode 26.4.x; fall back to whatever is newest.
+          for candidate in /Applications/Xcode_26.4.1.app /Applications/Xcode_26.4.app; do
+            if [ -d "$candidate" ]; then sudo xcode-select --switch "$candidate"; break; fi
+          done
+          xcodebuild -version
+          echo "iOS SDKs:"; xcodebuild -showsdks | grep -i iphoneos || true
+
+      - name: ➕ Add repo `bin` to PATH
+        run: echo "$(pwd)/bin" >> $GITHUB_PATH
+
+      - name: 💎 Setup Ruby + CocoaPods (from repo Gemfile)
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2.2'
+          bundler-cache: true
+
+      - name: 🔨 Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: 🔨 Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: 📦 Install monorepo node modules
+        run: pnpm install --frozen-lockfile
+
+      # Expo Go's Podfile sets RCT_USE_PREBUILT_RNCORE=0 / RCT_USE_RN_DEP=0, i.e.
+      # React Native (and Hermes) are compiled from the react-native-lab submodule.
+      # That submodule needs its own node_modules.
+      - name: 📦 Install react-native-lab node modules
+        run: pnpm install:react-native-lab
+
+      # Optional: embedded Snack runtime. Not needed to open your own projects.
+      # If the download fails we turn the flag off so the app doesn't look for a
+      # bundle that isn't there.
+      - name: 🍫 Download Snack runtime (optional)
+        continue-on-error: true
+        working-directory: apps/expo-go
+        run: node scripts/download-snack-runtime.js
+
+      - name: 🩹 Disable code signing in the Xcode project
+        run: |
+          set -euxo pipefail
+          PBX="$IOS_DIR/Exponent.xcodeproj/project.pbxproj"
+
+          # Expo Go's entitlements request Push, Sign in with Apple, Associated
+          # Domains and iCloud containers. None of those are available to a free
+          # Apple ID, and SideStore strips/rewrites entitlements anyway.
+          sed -i '' '/CODE_SIGN_ENTITLEMENTS = /d' "$PBX"
+          sed -i '' '/DEVELOPMENT_TEAM = /d' "$PBX"
+          sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = "[^"]*";/PROVISIONING_PROFILE_SPECIFIER = "";/' "$PBX"
+          sed -i '' 's/CODE_SIGN_IDENTITY = "[^"]*";/CODE_SIGN_IDENTITY = "";/' "$PBX"
+
+          grep -nE 'CODE_SIGN|PROVISIONING|DEVELOPMENT_TEAM' "$PBX" || echo "(no signing settings left)"
+
+          # If the Snack runtime download failed, don't claim we have one.
+          if [ ! -d "$IOS_DIR/Exponent/Supporting/SnackRuntime" ]; then
+            cat > "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>USE_EMBEDDED_SNACK_RUNTIME</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
+            # heredoc above is indented; strip the indentation
+            sed -i '' 's/^          //' "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
+            plutil -lint "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
+          fi
+
+      - name: ✂️ Drop notification service extension
+        if: ${{ inputs.drop_notification_extension }}
+        run: |
+          set -euxo pipefail
+          # Removes the .appex from the "Embed App Extensions" copy phase so
+          # SideStore only has to register one App ID.
+          ruby -e '
+            path = ENV["IOS_DIR"] + "/Exponent.xcodeproj/project.pbxproj"
+            src = File.read(path)
+            src = src.gsub(/^.*ExpoNotificationServiceExtension\.appex in Embed.*$\n/, "")
+            File.write(path, src)
+          '
+
+      - name: 🥥 pod install
+        working-directory: apps/expo-go/ios
+        run: bundle exec pod install
+
+      - name: 🏗️ Archive (unsigned)
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          set +e
+          xcodebuild archive \
+            -workspace "$IOS_DIR/Exponent.xcworkspace" \
+            -scheme "Expo Go" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/ExpoGo.xcarchive" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            2>&1 | tee "$LOG" | grep --line-buffered -E 'error:|warning: (Run script|Skipping)|^\*\* |Archive Succeeded|CompileSwiftSources|CompileC .*\.(m|mm|cpp)$'
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::group::xcodebuild errors"
+            grep -E 'error:' "$LOG" | sort -u | head -80 || true
+            echo "::endgroup::"
+            echo "::group::last 300 lines"
+            tail -300 "$LOG"
+            echo "::endgroup::"
+            exit "$STATUS"
+          fi
+
+      - name: 📤 Upload xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: 📦 Package .ipa
+        run: |
+          set -euxo pipefail
+          APP=$(find "$RUNNER_TEMP/ExpoGo.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -1)
+          test -n "$APP"
+
+          # Sanity: must be a device build, not a simulator one.
+          PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$APP/Info.plist")
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
+          VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+          echo "platform=$PLATFORM bundle=$BUNDLE_ID version=$VERSION"
+          test "$PLATFORM" = "iphoneos"
+
+          # Should be unsigned: no provisioning profile embedded.
+          if [ -f "$APP/embedded.mobileprovision" ]; then
+            echo "unexpected: app is signed"; exit 1
+          fi
+          codesign -dv "$APP" 2>&1 | head -5 || true
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" Payload
+          ls -lh *.ipa
+          echo "IPA_PATH=$RUNNER_TEMP/ipa/ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" >> $GITHUB_ENV
+
+      - name: 📤 Upload .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExpoGo-sdk-${{ env.SDK_VERSION }}-unsigned-ipa
+          path: ${{ env.IPA_PATH }}
+          compression-level: 0
+          retention-days: 30
