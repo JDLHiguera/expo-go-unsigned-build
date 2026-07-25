@@ -140,6 +140,19 @@ jobs:
             plutil -lint "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
           fi
 
+      # `Generate Dynamic Macros` writes EXBuildConstants.plist during the build,
+      # but the file only reaches the .app through the synchronized folder group,
+      # which snapshots the disk *before* the build runs. So generate it up front
+      # with the project's own script; the in-build phase then just rewrites the
+      # same values. Without this the app ships with no EXBuildConstants.plist and
+      # BuildConstants.swift bails out early -> apiServerEndpoint/sdkVersion nil.
+      - name: 🧬 Pre-generate EXBuildConstants.plist
+        working-directory: apps/expo-go/ios
+        run: |
+          set -euo pipefail
+          ./Build-Phases/generate-dynamic-macros.sh --configuration Release
+          plutil -p Exponent/Supporting/EXBuildConstants.plist
+
       - name: ✂️ Drop notification service extension
         if: ${{ inputs.drop_notification_extension }}
         run: |
@@ -218,6 +231,13 @@ jobs:
             echo "unexpected: app is signed"; exit 1
           fi
           codesign -dv "$APP" 2>&1 | head -5 || true
+
+          # BuildConstants.swift returns early if this is missing, leaving
+          # apiServerEndpoint and sdkVersion nil -> app can't open projects.
+          test -f "$APP/EXBuildConstants.plist"
+          /usr/libexec/PlistBuddy -c 'Print' "$APP/EXBuildConstants.plist"
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print :TEMPORARY_SDK_VERSION' "$APP/EXBuildConstants.plist")"
+          test -n "$(/usr/libexec/PlistBuddy -c 'Print :API_SERVER_ENDPOINT' "$APP/EXBuildConstants.plist")"
 
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
