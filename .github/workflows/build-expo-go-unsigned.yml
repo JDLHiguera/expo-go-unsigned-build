@@ -100,7 +100,15 @@ jobs:
       - name: 🍫 Download Snack runtime (optional)
         continue-on-error: true
         working-directory: apps/expo-go
-        run: node scripts/download-snack-runtime.js
+        run: |
+          node scripts/download-snack-runtime.js
+          # `Exponent/` is a PBXFileSystemSynchronizedRootGroup, so everything on
+          # disk under it is bundled automatically and flattened into the .app.
+          # The Snack downloader writes a docs README.md that then collides with
+          # Exponent/DevMenu/ProjectSource/Resources/README.md ("Multiple commands
+          # produce .../Expo Go.app/README.md"). The official Expo Go .app ships
+          # only the DevMenu one, so drop this.
+          rm -f ios/Exponent/Supporting/SnackRuntime/README.md
 
       - name: 🩹 Disable code signing in the Xcode project
         run: |
@@ -129,8 +137,6 @@ jobs:
           </dict>
           </plist>
           PLIST
-            # heredoc above is indented; strip the indentation
-            sed -i '' 's/^          //' "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
             plutil -lint "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
           fi
 
