@@ -1,3 +1,4 @@
+
 name: Build Expo Go (unsigned IPA)
 
 # Builds the Expo Go app from expo/expo source as an UNSIGNED .ipa,
@@ -40,9 +41,7 @@ jobs:
           submodules: true
           fetch-depth: 1
 
-      # The .gitmodules for react-native-lab uses an SSH URL; actions/checkout
-      # rewrites it to HTTPS via insteadOf, but re-assert it in case a nested
-      # submodule slips through.
+      # Force HTTPS for submodules.
       - name: 🔗 Force HTTPS for submodules
         run: |
           git config --global url."https://github.com/".insteadOf "git@github.com:"
@@ -60,13 +59,16 @@ jobs:
           ls -d /Applications/Xcode*.app || true
           # Expo builds SDK 57 with Xcode 26.4.x; fall back to whatever is newest.
           for candidate in /Applications/Xcode_26.4.1.app /Applications/Xcode_26.4.app; do
-            if [ -d "$candidate" ]; then sudo xcode-select --switch "$candidate"; break; fi
+            if [ -d "$candidate" ]; then
+              sudo xcode-select --switch "$candidate"
+              break
+            fi
           done
           xcodebuild -version
           echo "iOS SDKs:"
           xcodebuild -showsdks | grep -i iphoneos || true
 
-      - name: ➕ Add repo `bin` to PATH
+      - name: ➕ Add repo bin to PATH
         run: echo "$(pwd)/bin" >> "$GITHUB_PATH"
 
       - name: 💎 Setup Ruby + CocoaPods (from repo Gemfile)
@@ -75,29 +77,11 @@ jobs:
           ruby-version: '3.2.2'
           bundler-cache: true
 
-      - name: 🔎 Read required pnpm version
-        shell: bash
-        run: |
-          set -euo pipefail
-          PNPM_VERSION="$(node -p '
-            const packageManager = require("./package.json").packageManager || "";
-            packageManager.startsWith("pnpm@")
-              ? packageManager.slice("pnpm@".length)
-              : "";
-          ')"
-
-          if [ -z "$PNPM_VERSION" ]; then
-            echo "package.json does not declare a pnpm version in packageManager"
-            exit 1
-          fi
-
-          echo "Using pnpm $PNPM_VERSION"
-          echo "PNPM_VERSION=$PNPM_VERSION" >> "$GITHUB_ENV"
-
+      # Install the pnpm version required by the repository.
       - name: 🔨 Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: ${{ env.PNPM_VERSION }}
+          version: 12.2.1
 
       - name: 🔨 Setup Node
         uses: actions/setup-node@v4
@@ -108,26 +92,16 @@ jobs:
       - name: 📦 Install monorepo node modules
         run: pnpm install --frozen-lockfile
 
-      # Expo Go's Podfile sets RCT_USE_PREBUILT_RNCORE=0 / RCT_USE_RN_DEP=0, i.e.
-      # React Native (and Hermes) are compiled from the react-native-lab submodule.
-      # That submodule needs its own node_modules.
+      # React Native Lab needs its own node_modules.
       - name: 📦 Install react-native-lab node modules
         run: pnpm install:react-native-lab
 
-      # Optional: embedded Snack runtime. Not needed to open your own projects.
-      # If the download fails we turn the flag off so the app doesn't look for a
-      # bundle that isn't there.
+      # Optional embedded Snack runtime.
       - name: 🍫 Download Snack runtime (optional)
         continue-on-error: true
         working-directory: apps/expo-go
         run: |
           node scripts/download-snack-runtime.js
-          # `Exponent/` is a PBXFileSystemSynchronizedRootGroup, so everything on
-          # disk under it is bundled automatically and flattened into the .app.
-          # The Snack downloader writes a docs README.md that then collides with
-          # Exponent/DevMenu/ProjectSource/Resources/README.md ("Multiple commands
-          # produce .../Expo Go.app/README.md"). The official Expo Go .app ships
-          # only the DevMenu one, so drop this.
           rm -f ios/Exponent/Supporting/SnackRuntime/README.md
 
       - name: 🩹 Disable code signing in the Xcode project
@@ -135,9 +109,7 @@ jobs:
           set -euxo pipefail
           PBX="$IOS_DIR/Exponent.xcodeproj/project.pbxproj"
 
-          # Expo Go's entitlements request Push, Sign in with Apple, Associated
-          # Domains and iCloud containers. None of those are available to a free
-          # Apple ID, and SideStore strips/rewrites entitlements anyway.
+          # Remove entitlements unavailable to a free Apple ID.
           sed -i '' '/CODE_SIGN_ENTITLEMENTS = /d' "$PBX"
           sed -i '' '/DEVELOPMENT_TEAM = /d' "$PBX"
           sed -i '' 's/PROVISIONING_PROFILE_SPECIFIER = "[^"]*";/PROVISIONING_PROFILE_SPECIFIER = "";/' "$PBX"
@@ -145,7 +117,7 @@ jobs:
 
           grep -nE 'CODE_SIGN|PROVISIONING|DEVELOPMENT_TEAM' "$PBX" || echo "(no signing settings left)"
 
-          # If the Snack runtime download failed, don't claim we have one.
+          # Disable the embedded Snack runtime if its download failed.
           if [ ! -d "$IOS_DIR/Exponent/Supporting/SnackRuntime" ]; then
             cat > "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -160,12 +132,7 @@ jobs:
             plutil -lint "$IOS_DIR/Exponent/Supporting/EXBuildConstants.plist"
           fi
 
-      # `Generate Dynamic Macros` writes EXBuildConstants.plist during the build,
-      # but the file only reaches the .app through the synchronized folder group,
-      # which snapshots the disk *before* the build runs. So generate it up front
-      # with the project's own script; the in-build phase then just rewrites the
-      # same values. Without this the app ships with no EXBuildConstants.plist and
-      # BuildConstants.swift bails out early -> apiServerEndpoint/sdkVersion nil.
+      # Generate build constants before the Xcode archive.
       - name: 🧬 Pre-generate EXBuildConstants.plist
         working-directory: apps/expo-go/ios
         run: |
@@ -177,8 +144,6 @@ jobs:
         if: ${{ inputs.drop_notification_extension }}
         run: |
           set -euxo pipefail
-          # Removes the .appex from the "Embed App Extensions" copy phase so
-          # SideStore only has to register one App ID.
           ruby -e '
             path = ENV["IOS_DIR"] + "/Exponent.xcodeproj/project.pbxproj"
             src = File.read(path)
@@ -195,6 +160,7 @@ jobs:
           set -uo pipefail
           LOG="$RUNNER_TEMP/xcodebuild.log"
           set +e
+
           xcodebuild archive \
             -workspace "$IOS_DIR/Exponent.xcworkspace" \
             -scheme "Expo Go" \
@@ -213,15 +179,19 @@ jobs:
             DEVELOPMENT_TEAM="" \
             ENABLE_USER_SCRIPT_SANDBOXING=NO \
             2>&1 | tee "$LOG" | grep --line-buffered -E 'error:|warning: (Run script|Skipping)|^\*\* |Archive Succeeded|CompileSwiftSources|CompileC .*\.(m|mm|cpp)$'
+
           STATUS=${PIPESTATUS[0]}
           set -e
+
           if [ "$STATUS" -ne 0 ]; then
             echo "::group::xcodebuild errors"
             grep -E 'error:' "$LOG" | sort -u | head -80 || true
             echo "::endgroup::"
+
             echo "::group::last 300 lines"
             tail -300 "$LOG"
             echo "::endgroup::"
+
             exit "$STATUS"
           fi
 
@@ -236,25 +206,27 @@ jobs:
       - name: 📦 Package .ipa
         run: |
           set -euxo pipefail
+
           APP=$(find "$RUNNER_TEMP/ExpoGo.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' | head -1)
           test -n "$APP"
 
-          # Sanity: must be a device build, not a simulator one.
+          # Ensure this is a device build, not a simulator build.
           PLATFORM=$(/usr/libexec/PlistBuddy -c 'Print :DTPlatformName' "$APP/Info.plist")
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
           VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist")
+
           echo "platform=$PLATFORM bundle=$BUNDLE_ID version=$VERSION"
           test "$PLATFORM" = "iphoneos"
 
-          # Should be unsigned: no provisioning profile embedded.
+          # Ensure the app is unsigned.
           if [ -f "$APP/embedded.mobileprovision" ]; then
             echo "unexpected: app is signed"
             exit 1
           fi
+
           codesign -dv "$APP" 2>&1 | head -5 || true
 
-          # BuildConstants.swift returns early if this is missing, leaving
-          # apiServerEndpoint and sdkVersion nil -> app can't open projects.
+          # Ensure required build constants are present.
           test -f "$APP/EXBuildConstants.plist"
           /usr/libexec/PlistBuddy -c 'Print' "$APP/EXBuildConstants.plist"
           test -n "$(/usr/libexec/PlistBuddy -c 'Print :TEMPORARY_SDK_VERSION' "$APP/EXBuildConstants.plist")"
@@ -263,8 +235,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
           cd "$RUNNER_TEMP/ipa"
+
           zip -qry "ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" Payload
           ls -lh *.ipa
+
           echo "IPA_PATH=$RUNNER_TEMP/ipa/ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" >> "$GITHUB_ENV"
 
       - name: 📤 Upload .ipa
