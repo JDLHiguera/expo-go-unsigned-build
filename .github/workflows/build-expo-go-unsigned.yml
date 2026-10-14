@@ -53,7 +53,7 @@ jobs:
           echo "sdkVersions.json: $(cat apps/expo-go/sdkVersions.json)"
           echo "packages/expo version: $(node -p "require('./packages/expo/package.json').version")"
           echo "react-native version: $(node -p "require('./apps/expo-go/package.json').dependencies['react-native']")"
-          echo "SDK_VERSION=$(node -p "require('./apps/expo-go/sdkVersions.json').sdkVersion")" >> $GITHUB_ENV
+          echo "SDK_VERSION=$(node -p "require('./apps/expo-go/sdkVersions.json').sdkVersion")" >> "$GITHUB_ENV"
 
       - name: 🔨 Select Xcode
         run: |
@@ -63,10 +63,11 @@ jobs:
             if [ -d "$candidate" ]; then sudo xcode-select --switch "$candidate"; break; fi
           done
           xcodebuild -version
-          echo "iOS SDKs:"; xcodebuild -showsdks | grep -i iphoneos || true
+          echo "iOS SDKs:"
+          xcodebuild -showsdks | grep -i iphoneos || true
 
       - name: ➕ Add repo `bin` to PATH
-        run: echo "$(pwd)/bin" >> $GITHUB_PATH
+        run: echo "$(pwd)/bin" >> "$GITHUB_PATH"
 
       - name: 💎 Setup Ruby + CocoaPods (from repo Gemfile)
         uses: ruby/setup-ruby@v1
@@ -74,10 +75,29 @@ jobs:
           ruby-version: '3.2.2'
           bundler-cache: true
 
+      - name: 🔎 Read required pnpm version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PNPM_VERSION="$(node -p '
+            const packageManager = require("./package.json").packageManager || "";
+            packageManager.startsWith("pnpm@")
+              ? packageManager.slice("pnpm@".length)
+              : "";
+          ')"
+
+          if [ -z "$PNPM_VERSION" ]; then
+            echo "package.json does not declare a pnpm version in packageManager"
+            exit 1
+          fi
+
+          echo "Using pnpm $PNPM_VERSION"
+          echo "PNPM_VERSION=$PNPM_VERSION" >> "$GITHUB_ENV"
+
       - name: 🔨 Install pnpm
         uses: pnpm/action-setup@v4
         with:
-          version: 10
+          version: ${{ env.PNPM_VERSION }}
 
       - name: 🔨 Setup Node
         uses: actions/setup-node@v4
@@ -228,7 +248,8 @@ jobs:
 
           # Should be unsigned: no provisioning profile embedded.
           if [ -f "$APP/embedded.mobileprovision" ]; then
-            echo "unexpected: app is signed"; exit 1
+            echo "unexpected: app is signed"
+            exit 1
           fi
           codesign -dv "$APP" 2>&1 | head -5 || true
 
@@ -244,7 +265,7 @@ jobs:
           cd "$RUNNER_TEMP/ipa"
           zip -qry "ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" Payload
           ls -lh *.ipa
-          echo "IPA_PATH=$RUNNER_TEMP/ipa/ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" >> $GITHUB_ENV
+          echo "IPA_PATH=$RUNNER_TEMP/ipa/ExpoGo-sdk-${SDK_VERSION}-unsigned.ipa" >> "$GITHUB_ENV"
 
       - name: 📤 Upload .ipa
         uses: actions/upload-artifact@v4
